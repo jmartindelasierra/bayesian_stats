@@ -39,8 +39,11 @@ model_string <- "model {
                         ifelse(contestant1 != 2 && host != 2, 2,
                               ifelse(contestant1 != 3 && host != 3, 3, 0)))
   
+  # Wins with stay strategy
+  # win <- ifelse(contestant1 == prize, 0, 1) # In the plot: 0 = stay, 1 = switch
+  
   # Wins with switch strategy
-  win <- ifelse(contestant2 == prize, 1, 0)
+  win <- ifelse(contestant2 == prize, 1, 0) # In the plot: 0 = stay, 1 = switch
 }"
 
 set.seed(100)
