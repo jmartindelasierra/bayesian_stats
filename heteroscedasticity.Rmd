@@ -1,0 +1,397 @@
+---
+title: |
+ <center>Notes on Bayesian regression modeling</center>
+ <center>in the presence of heteroscedasticity</center>
+author: Jesús Martín de la Sierra
+output:
+  pdf_document:
+    fig_caption: yes
+    extra_dependencies: ["float"]
+header-includes:
+ \renewcommand{\topfraction}{.85}
+ \renewcommand{\bottomfraction}{.7}
+ \renewcommand{\textfraction}{.15}
+ \renewcommand{\floatpagefraction}{.66}
+ \setcounter{topnumber}{3}
+ \setcounter{bottomnumber}{3}
+ \setcounter{totalnumber}{4}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(broom)
+library(Metrics)
+
+library(ggplot2)
+library(patchwork)
+
+library(rjags)
+library(tidybayes)
+library(modelr)
+```
+
+```{r}
+data("Orange", package = "datasets")
+```
+
+\newpage
+
+Consider a data set where each observation represents the age and trunk circumference for a given orange tree (Figure \ref{fig:scatter}). For this work, we want to compute a linear regression to estimate the age provided its circumference.
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:scatter}Growth of orange trees. The circumference is given in millimeters at breast height. The age are the days since 1968/12/31."}
+Orange %>%
+  mutate(Tree = as.factor(as.integer(Tree))) %>%
+  ggplot(aes(x = circumference, y = age)) +
+  geom_point(alpha = 0.6) +
+  theme_bw() + 
+  labs(title = "Growth of orange trees",
+       x = "Circumference",
+       y = "Age")
+```
+
+The apparent linearity of the data is supported by a strong correlation of 0.91 between `circumference` and `age`. We'll start by modeling the growth with the following linear equation and using the ordinary least squares method:
+$$y_i = \alpha + \beta x_i,$$
+
+where $x_i$ are the `circumference` values, $y_i$ the `age`s, $\alpha$ the intercept and $\beta$ the slope. Both $\alpha$ and $\beta$ are the coefficients to estimate.
+
+After computing the OLS regression, we obtain the estimates and confidence intervals for $\alpha$ and $\beta$ shown in Table 1 and Table 2. The model performance in terms of MAE and RMSE is shown in Table 3.
+
+```{r}
+ols_model <- lm(formula = age ~ circumference, data = Orange)
+
+tidy(ols_model) %>%
+  mutate(term = c("alpha", "beta")) %>%
+  knitr::kable(caption = "Estimates from OLS regression.")
+
+confint(ols_model) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  mutate(term = c("alpha", "beta"), width = `97.5 %` - `2.5 %`) %>%
+  knitr::kable(caption = "95% confidence intervals from OLS regression.")
+
+data.frame(MAE = Metrics::mae(augment(ols_model)$age,
+                              augment(ols_model)$.fitted) %>% round(2),
+           RMSE = Metrics::rmse(augment(ols_model)$age,
+                                augment(ols_model)$.fitted) %>% round(2)) %>%
+  knitr::kable(caption = "OLS model performance.")
+```
+
+The mean estimate and 95% confidence and prediction intervals are shown in Figure \ref{fig:ols} to illustrate the resulting OLS regression on our data.
+
+```{r}
+ols_results <- augment(ols_model) %>%
+  select(age, circumference, .fitted, .resid, .std.resid) %>%
+  bind_cols(predict(ols_model, Orange, interval = "confidence") %>%
+              as_tibble() %>%
+              select(-fit) %>%
+              setNames(c("ci_lwr", "ci_upr"))) %>%
+  bind_cols(predict(ols_model, Orange, interval = "prediction") %>%
+              as_tibble() %>%
+              select(-fit) %>%
+              setNames(c("pi_lwr", "pi_upr"))) %>%
+  unique()
+```
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:ols}Ordinary least squares regression. Mean estimate (continuous) and 95\\% confidence (dashed) and prediction (dotted) intervals."}
+ols_results %>%
+  ggplot(aes(x = circumference)) +
+  geom_point(aes(y = age), alpha = 0.6) +
+  geom_ribbon(aes(ymin = ci_lwr, ymax = ci_upr), linetype = "dashed", fill = NA, color = "gray50") +
+  geom_ribbon(aes(ymin = pi_lwr, ymax = pi_upr), linetype = "dotted", fill = NA, color = "gray50") +
+  geom_line(aes(y = .fitted), size = 0.8) +
+  theme_bw() +
+  labs(title = "Growth of orange trees",
+       x = "Circumference",
+       y = "Age")
+```
+
+Now we'll conduct some model diagnostics. We've seen before that the relationship between `circumference` and `age` is linear according to their high correlation, but this could be misleading. To assume a linearity in the sense that `circumference` is linear with the mean of `age`, we should see normally distributed residuals after the fitting. However, by plotting the residuals vs the fitted values, they don't look normally distributed at all (Figure \ref{fig:res_vs_fit}).
+
+Our choice of `circumference` as independent variable and `age` as response variable can be subject of discussion. In this configuration, there are missing `age`s for `circumference`s greater than 150 millimeters, loosing linearity in the upper range of `circumference` values. For the purpose of this work, and argued by the lack of observations, we'll consider that the linearity assumption holds true and we can still fit the data with a linear model.
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:res_vs_fit}Linearity diagnostics for the OLS regression model."}
+ols_results %>%
+  ggplot(aes(x = circumference, y = .resid)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(se = FALSE, size = 0.8, color = "black") +
+  theme_bw() +
+  labs(title = "Residuals vs fitted values",
+       x = "Fitted values",
+       y = "Residuals")
+```
+
+Next, we must check the residuals variance where we expect them to be constant. For this diagnostic we can plot the so called scale-location or scale-spread diagram (Figure \ref{fig:scale_loc}).
+
+We clearly see that the variance isn't constant but there is a pattern. For the upper half of the fitted values the residuals have a greater variance than for the lower half, roughly speaking. This trend was already observable in previous figures and sure you already noticed that cone shaped pattern.
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:scale_loc}Heteroscedasticity diagnostics for the OLS regression model."}
+ols_results %>%
+  ggplot(aes(x = circumference, y = sqrt(abs(.std.resid)))) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE, size = 0.8, color = "black") +
+  theme_bw() +
+  labs(title = "Scale-location",
+       x = "Fitted values",
+       y = expression(sqrt(abs("Std. residuals"))))
+```
+
+Here we've a problem of unequal variance in the context of the residuals. This phenomena is what we know as heteroscedasticity and it's a problem because the OLS regression method assumes that the variance is homogeneous. If it's not constant along the fitted values, the coefficient estimates become less accurate. This means that in spite they keep unbiased, the underlying statistics estimators like the standard errors are likely wrong. Therefore, the confidence and prediction intervals aren't trustworthy either. If you observe Figure \ref{fig:ols}, the confidence interval may not look much different as expected, but the prediction interval has an almost constant width in contrast to the cone shaped data points. Our intuition is that this interval should follow that same shape.
+
+Look now at the intercept coefficient in Table 1. The estimate was 16.6 and its standard error 78.14. This gives a t-test statistic (a measure of departure of the estimate from the hypothesized value 0) of $t = \alpha / s.e. = 0.21$. The p-value, the probability of observing a value at least as extreme as $t$, is 0.83, much greater than a typical significance assumption, so the null hypothesis that $\alpha$ is 0 can't be rejected. Then, we've a large value of standard error respect to the estimate, a small t-test statistic and a large p-value: the intercept coefficient lacks of accuracy of its statistics and, although the estimate may not be unbiased, it's very likely that its uncertainty intervals are wrong.
+
+Instead of fixing the problem of heteroscedasticity, we'll focus on the target of making the confidence and prediction intervals more accurate. For this we'll build a model from a different philosophy, changing the entire concept of regression from a frequentist to a Bayesian approach, meaning that the new model will be formulated using distributions.
+
+Now consider the following formulation for $y_i$ where we've added the error term $\epsilon_i$:
+
+$$y_i = \alpha + \beta x_i + \epsilon_i.$$
+
+We assume these errors $\epsilon_i$ are independent and identically distributed as normal random variables with mean 0 and variance $\sigma^2$.
+
+With this assumption, the responses $y_i$ turn out to be random variables conditioned to $x_i$, $\alpha$, $\beta$ and $\sigma$. In addition, since we're looking for a varying variance, we also define $\sigma = \omega x_i$, with $\omega$ a new parameter to be estimated. This way, $\sigma$ increases or decreases linearly with $x_i$.
+
+Our Bayesian model can then be specified as follows:
+
+$$y_i | \mu, \sigma \sim \mathcal{N} (\mu, \sigma^2)$$
+$$\mu = \alpha + \beta x_i$$
+$$\sigma = \omega x_i $$
+
+We also need the prior distributions of the parameters $\alpha$, $\beta$ and $\omega$. The OLS regression estimates in Table 1 gives us some clues about the parameter prior beliefs:
+
+$$\alpha \sim \mathcal{N} (0, 100)$$
+$$\beta \sim \mathcal{N} (10, 10)$$
+$$\omega \sim \Gamma(1, 5)$$
+
+```{r fig.width=9, fig.height=3, fig.align='center', fig.cap="\\label{fig:priors}Parameter prior distributions.", eval=FALSE, include=FALSE}
+p1 <- ggplot(data = tibble(x = -300:300), aes(x = x)) +
+  stat_function(fun = dnorm, args = list(mean = 0, sd = 100), size = 0.8) +
+  scale_x_continuous(breaks = c(-200, -100, 0, 100, 200)) +
+  theme_bw() +
+  labs(title = expression(paste(alpha, " prior distribution")),
+       x = expression(paste(alpha)),
+       y = expression(paste("p(", alpha, ")")))
+
+p2 <- ggplot(data = tibble(x = -20:40), aes(x = x)) +
+  stat_function(fun = dnorm, args = list(mean = 10, sd = 10), size = 0.8) +
+  scale_x_continuous(breaks = c(-20, -5, 10, 25, 40)) +
+  theme_bw() +
+  labs(title = expression(paste(beta, " prior distribution")),
+       x = expression(beta),
+       y = expression(paste("p(", beta, ")")))
+
+p3 <- ggplot(data = tibble(x = 0:8), aes(x = x)) +
+  stat_function(fun = dgamma, args = list(shape = 1.5, rate = 1), size = 0.8) +
+  scale_x_continuous(breaks = 0:8) +
+  theme_bw() +
+  labs(title = expression(paste(omega, " prior distribution")),
+       x = expression(omega),
+       y = expression(paste("p(", omega, ")")))
+
+p1 | p2 | p3
+```
+
+After making the model to converge, we obtain the posterior estimates in Table 4, the 95% credible intervals in Table 5 and the corresponding distributions in Figure \ref{fig:posteriors}. Additionally, we show the joint posterior distribution for $\alpha$ and $\beta$, the two parameters associated to the mean estimate, in Figure \ref{fig:joint_posteriors}.
+
+```{r}
+model_string <- "model {
+  # Likelihood
+  for (i in 1:length(age)) {
+    age[i] ~ dnorm(mu[i], tau_eff[i])
+    mu[i] <- alpha + beta * circumference[i]
+    tau_eff[i] <- 1 / pow(omega * circumference[i], 2)
+  }
+  
+  # Priors
+  alpha ~ dnorm(0, 1/(100^2))
+  beta ~ dnorm(10, 1/(10^2))
+  omega ~ dgamma(1.5, 1)
+}"
+
+model_data <- list(age = Orange$age,
+                   circumference = Orange$circumference)
+
+params <- c("alpha", "beta", "omega")
+
+set.seed(100)
+
+bayes_model <- jags.model(textConnection(model_string), 
+                          data = model_data, 
+                          n.chains = 3,
+                          quiet = TRUE)
+
+update(bayes_model, 2000, progress.bar = "none")
+
+bayes_sim <- coda.samples(model = bayes_model,
+                          variable.names = params,
+                          n.iter = 8000,
+                          progress.bar = "none")
+```
+
+```{r}
+summary(bayes_sim)$statistics %>%
+  knitr::kable(caption = "Posterior estimates from Bayesian regression.")
+
+summary(bayes_sim)$quantiles %>%
+  as.data.frame() %>%
+  mutate(width = `97.5%` - `2.5%`) %>%
+  select(-(2:4)) %>%
+  knitr::kable(caption = "95% credible intervals from Bayesian regression.")
+```
+
+```{r fig.width=9, fig.height=3, fig.align='center', fig.cap="\\label{fig:posteriors}Parameter posterior distributions with estimates and 95\\% credible intervals."}
+p1 <- bayes_sim %>%
+  spread_draws(alpha, beta, omega) %>%
+  ggplot() +
+  stat_halfeye(aes(x = alpha), show_interval = TRUE, .width = 0.95, point_interval = median_hdi, fill = NA, slab_color = "black", slab_size = 0.8, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Greys", direction = -1) +
+  theme_bw() +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(title = expression(paste(alpha, " posterior distribution")),
+       x = expression(paste(alpha)),
+       y = expression(paste("p(", alpha, "|D)")))
+
+p2 <- bayes_sim %>%
+  spread_draws(alpha, beta, omega) %>%
+  ggplot() +
+  stat_halfeye(aes(x = beta), show_interval = TRUE, .width = 0.95, point_interval = median_hdi, fill = NA, slab_color = "black", slab_size = 0.8, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Greys", direction = -1) +
+  theme_bw() +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(title = expression(paste(beta, " posterior distribution")),
+       x = expression(paste(beta)),
+       y = expression(paste("p(", beta, "|D)")))
+
+p3 <- bayes_sim %>%
+  spread_draws(alpha, beta, omega) %>%
+  ggplot() +
+  stat_halfeye(aes(x = omega), show_interval = TRUE, .width = 0.95, point_interval = median_hdi, fill = NA, slab_color = "black", slab_size = 0.8, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Greys", direction = -1) +
+  theme_bw() +
+  scale_x_continuous(breaks = scales::pretty_breaks()) +
+  labs(title = expression(paste(omega, " posterior distribution")),
+       x = expression(paste(omega)),
+       y = expression(paste("p(", omega, "|D)")))
+
+p1 | p2 | p3
+```
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:joint_posteriors}Joint posterior distribution for $\\alpha$ and $\\beta$."}
+bayes_sim %>%
+  spread_draws(alpha, beta, omega) %>%
+  ggplot(aes(x = alpha, y = beta)) +
+  stat_density_2d(geom = "raster", aes(fill = stat(density), alpha = stat(density)), contour = FALSE) +
+  scale_fill_gradient(low = "white", high = "black") +
+  scale_alpha_continuous(guide = guide_none()) +
+  theme_bw() +
+  labs(title = expression(paste("Joint posterior distribution for ", alpha, " and ", beta)),
+       x = expression(paste("p(", alpha, "|D)")),
+       y = expression(paste("p(", beta, "|D)")),
+       fill = expression(paste("p(", alpha, ", ", beta, "|D)")))
+```
+
+One remarkable difference with the OLS method is that the Bayesian model has estimated a negative intercept at one order of magnitude higher. In counterpart, the slope suffers a slightly increase. This combination translates into a better linearity for the lower half of `circumference` values (Figure \ref{fig:bayes_res_vs_fit}). Remember that the upper `circumference` values lack of response data because of the choice of the independent and response variables, so we would expect a better linearity in general if additional data where provided.
+
+```{r}
+bayes_csim <- do.call(rbind, bayes_sim)
+params <- apply(bayes_csim, 2, median)
+```
+
+```{r}
+rows <- nrow(bayes_csim)
+n_circ <- 60
+set.seed(100)
+
+bayes_results <- bayes_csim %>%
+  as.data.frame() %>%
+  mutate(circ = sample(seq_range(Orange$circumference, n = n_circ),
+                       size = rows,
+                       replace = TRUE)) %>%
+  mutate(mu = alpha + beta * circ,
+         sigma = omega * circ)
+```
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:bayes_res_vs_fit}Linearity diagnostics for the Bayesian regression model."}
+Orange %>%
+  select(age, circumference) %>%
+  mutate(estimate = params["alpha"] + params["beta"] * Orange$circumference,
+         resid = age - estimate) %>%
+  ggplot(aes(x = circumference, y = resid)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(se = FALSE, size = 0.8, color = "black") +
+  theme_bw() +
+  labs(title = "Residuals vs fitted values",
+       x = "Circumference",
+       y = "Residuals")
+```
+
+Now, let's compare Table 2 and Table 5. Both tables show the confidence and credible intervals for the model parameters. We can easily observe that the width intervals for the Bayesian model are narrower than for the OLS regression. Specifically, the intervals for the mean estimates of $\alpha$ and $\beta$ are about 2.6 and 1.2 times narrower. This result makes the Bayesian model more appropriate in terms of uncertainty.
+
+On the other hand, we also have the estimate for $\omega$, the parameter that makes the standard deviation to linearly change with $x_i$. The estimate produces a 1.75 standard deviation increase for each additional `circumference` millimeter (Figure \ref{fig:sigma}).
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:sigma}$\\sigma$ mean estimate (continuous) and 95\\% credible interval (dashed)."}
+bayes_results %>%
+  group_by(circ) %>%
+  median_hdci(sigma) %>%
+  ggplot(aes(x = circ)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), linetype = "dashed", fill = NA, color = "gray50") +
+  geom_line(aes(y = sigma), size = 0.8) +
+  theme_bw() +
+  labs(title = expression(paste(sigma, " variability")),
+       x = "Circumference",
+       y = expression(sigma))
+```
+
+Due to the varying variance in the model, the credible intervals are more realistic than the intervals in the OLS model since they now follow the cone shaped pattern of the data (Figure \ref{fig:bayesian}). However, if we compute the same performance metrics for this model we note that on average it performs worse than the OLS regression (Table 6). This makes sense as in the OLS model there is a more constant distribution of the error magnitudes.
+
+```{r fig.width=4, fig.height=3, fig.align='center', fig.cap="\\label{fig:bayesian}Bayesian regression. Mean estimate (continuous) and 95\\% credible (dashed) and prediction (dotted) intervals."}
+samples <- 10000
+
+cbind(bayes_results %>%
+        group_by(circ) %>%
+        median_hdci(),
+      bayes_results %>%
+        group_by(circ) %>%
+        summarise(age = rnorm(samples, mean = mu, sd = sigma)) %>%
+        median_hdi() %>%
+        select(age, age.lower = .lower, age.upper = .upper)) %>%
+  
+  ggplot(aes(x = circ)) +
+  geom_ribbon(aes(y = mu, ymin = mu.lower, ymax = mu.upper), linetype = "dashed", fill = NA, color = "gray50") +
+  geom_ribbon(aes(y = mu, ymin = age.lower, ymax = age.upper), linetype = "dotted", fill = NA, color = "gray50") +
+  geom_line(aes(y = mu), size = 0.8) +
+  geom_point(data = Orange, aes(x = circumference, y = age), alpha = 0.6) +
+  scale_y_continuous(breaks = seq(0, 2500, 500)) +
+  theme_bw() +
+  labs(title = "Growth of orange trees",
+       x = "Circumference",
+       y = "Age")
+```
+
+```{r}
+age_estim <- bayes_csim %>%
+  as.data.frame() %>%
+  mutate(circ = sample(Orange$circumference,
+                       size = rows,
+                       replace = TRUE)) %>%
+  mutate(age = Orange$age[match(circ, Orange$circumference)],
+         mu = alpha + beta * circ) %>%
+  select(circ, age, mu)
+
+data.frame(MAE = Metrics::mae(age_estim$age,
+                              age_estim$mu) %>% round(2),
+           MRSE = Metrics::rmse(age_estim$age,
+                                age_estim$mu) %>% round(2)) %>%
+  knitr::kable(caption = "Bayesian model performance.")
+```
+
+We built a model that provides a more realistic uncertainty intervals in a typical case of heteroscedasticity as the example in this work. This is interesting when we need to deal with the probability region for the mean estimate or individual predictions and it's certainly useful for many applications, but this approach can lead to a worse model performance in terms of MAE, RMSE or other metrics. We've to carefully study each particular problem to determine which model to adopt and make the most of each approach.
